@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from gridtrader.storage import LeaseUnavailable, SQLiteLedger
+from gridtrader.storage import InvariantViolation, LeaseUnavailable, SQLiteLedger
 
 from .support import NOW, fill_record, new_ledger, order_record, seed_grid
 
@@ -105,6 +105,35 @@ class RecoveryPersistenceTests(unittest.TestCase):
             latest = uow.recovery_checkpoints.latest_complete("strategy-1")
             self.assertEqual(checkpoint["checkpoint_id"], latest["checkpoint_id"])
 
+    def test_authoritative_rest_zero_position_can_tombstone_newer_local_update(self) -> None:
+        ledger = new_ledger(self.db_path)
+        with ledger.unit_of_work() as uow:
+            uow.positions.upsert({
+                "account_id": "coin-m-main",
+                "symbol": "BTCUSD_PERP",
+                "position_side": "both",
+                "quantity_contracts": 2,
+                "exchange_update_ms": NOW + 10_000,
+                "observed_at_ms": NOW,
+                "source": "USER_STREAM",
+            })
+            zero = uow.positions.upsert({
+                "account_id": "coin-m-main",
+                "symbol": "BTCUSD_PERP",
+                "position_side": "both",
+                "quantity_contracts": 0,
+                # Binance may report updateTime=0 for an inactive COIN-M
+                # position.  A later complete REST snapshot is still the
+                # authoritative zero-position tombstone.
+                "exchange_update_ms": 0,
+                "observed_at_ms": NOW + 1,
+                "source": "REST",
+            })
+            uow.commit()
+
+        self.assertEqual(zero["quantity_contracts"], 0)
+        self.assertEqual(zero["source"], "REST")
+
     def test_strategy_lease_uses_fencing_token_across_process_runs(self) -> None:
         ledger = new_ledger(self.db_path)
         with ledger.unit_of_work() as uow:
@@ -145,6 +174,239 @@ class RecoveryPersistenceTests(unittest.TestCase):
             )
             self.assertEqual(3, third["fencing_token"])
             uow.commit()
+
+    def test_strategy_lease_renewal_requires_exact_live_fencing_token(self) -> None:
+        ledger = new_ledger(self.db_path)
+        with ledger.unit_of_work() as uow:
+            seed_grid(uow)
+            for run_id in ("run-owner", "run-takeover"):
+                uow.bot_runs.add({
+                    "run_id": run_id,
+                    "instance_id": f"instance:{run_id}",
+                    "status": "RUNNING",
+                    "started_at_ms": NOW,
+                    "heartbeat_at_ms": NOW,
+                })
+            first = uow.strategy_leases.acquire(
+                strategy_id="strategy-1",
+                run_id="run-owner",
+                now_ms=NOW,
+                expires_at_ms=NOW + 100,
+            )
+            with self.assertRaises(LeaseUnavailable):
+                uow.strategy_leases.acquire(
+                    strategy_id="strategy-1",
+                    run_id="run-owner",
+                    now_ms=NOW + 1,
+                    expires_at_ms=NOW + 101,
+                )
+            renewed = uow.strategy_leases.renew(
+                strategy_id="strategy-1",
+                run_id="run-owner",
+                fencing_token=first["fencing_token"],
+                now_ms=NOW + 50,
+                expires_at_ms=NOW + 200,
+            )
+            self.assertEqual(first["fencing_token"], renewed["fencing_token"])
+            self.assertEqual(NOW + 200, renewed["expires_at_ms"])
+            uow.strategy_leases.require_owned(
+                strategy_id="strategy-1",
+                run_id="run-owner",
+                fencing_token=first["fencing_token"],
+                now_ms=NOW + 199,
+            )
+            with self.assertRaises(LeaseUnavailable):
+                uow.strategy_leases.renew(
+                    strategy_id="strategy-1",
+                    run_id="run-owner",
+                    fencing_token=999,
+                    now_ms=NOW + 60,
+                    expires_at_ms=NOW + 210,
+                )
+            takeover = uow.strategy_leases.acquire(
+                strategy_id="strategy-1",
+                run_id="run-takeover",
+                now_ms=NOW + 200,
+                expires_at_ms=NOW + 300,
+            )
+            self.assertEqual(first["fencing_token"] + 1, takeover["fencing_token"])
+            with self.assertRaises(LeaseUnavailable):
+                uow.strategy_leases.require_owned(
+                    strategy_id="strategy-1",
+                    run_id="run-owner",
+                    fencing_token=first["fencing_token"],
+                    now_ms=NOW + 200,
+                )
+            with self.assertRaises(LeaseUnavailable):
+                uow.strategy_leases.release(
+                    strategy_id="strategy-1",
+                    run_id="run-owner",
+                    fencing_token=first["fencing_token"],
+                )
+            uow.commit()
+
+    def test_phase2_replay_requires_explicit_complete_pagination(self) -> None:
+        ledger = new_ledger(self.db_path)
+        with ledger.unit_of_work() as uow:
+            checkpoint = uow.recovery_checkpoints.add({
+                "run_id": "run-phase2",
+                "strategy_id": None,
+                "account_id": "coin-m-main",
+                "symbol": "BTCUSD_PERP",
+                "reason": "STARTUP",
+                "status": "STARTED",
+                "recovery_epoch": 1,
+                "started_at_ms": NOW,
+            })
+            checkpoint = uow.recovery_checkpoints.advance(
+                checkpoint["checkpoint_id"],
+                status="SNAPSHOT_COMPLETE",
+                rest_server_time_ms=NOW + 1,
+                open_orders_observed_at_ms=NOW + 2,
+                position_observed_at_ms=NOW + 3,
+                margin_observed_at_ms=NOW + 4,
+            )
+
+            with self.assertRaisesRegex(
+                InvariantViolation,
+                "Phase-2 replay completion requires explicit complete pagination",
+            ):
+                uow.recovery_checkpoints.advance(
+                    checkpoint["checkpoint_id"],
+                    status="REPLAY_COMPLETE",
+                    fills_through_ms=NOW + 5,
+                )
+
+            replayed = uow.recovery_checkpoints.advance(
+                checkpoint["checkpoint_id"],
+                status="REPLAY_COMPLETE",
+                fills_through_ms=NOW + 5,
+                trades_complete=True,
+            )
+            self.assertEqual(1, replayed["trades_complete"])
+
+    def test_phase1_replay_keeps_legacy_completeness_inference(self) -> None:
+        ledger = new_ledger(self.db_path)
+        with ledger.unit_of_work() as uow:
+            checkpoint = uow.recovery_checkpoints.add({
+                "run_id": "run-phase1",
+                "strategy_id": None,
+                "account_id": "coin-m-main",
+                "symbol": "BTCUSD_PERP",
+                "reason": "STARTUP",
+                "status": "STARTED",
+                "started_at_ms": NOW,
+            })
+            checkpoint = uow.recovery_checkpoints.advance(
+                checkpoint["checkpoint_id"],
+                status="SNAPSHOT_COMPLETE",
+                rest_server_time_ms=NOW + 1,
+                open_orders_observed_at_ms=NOW + 2,
+                position_observed_at_ms=NOW + 3,
+                margin_observed_at_ms=NOW + 4,
+            )
+            checkpoint = uow.recovery_checkpoints.advance(
+                checkpoint["checkpoint_id"],
+                status="REPLAY_COMPLETE",
+                fills_through_ms=NOW + 5,
+            )
+            self.assertEqual(1, checkpoint["trades_complete"])
+
+    def test_phase2_complete_requires_mode_rules_and_exhausted_cursor(self) -> None:
+        ledger = new_ledger(self.db_path)
+
+        def build_reconciled(
+            uow: object,
+            run_id: str,
+            *,
+            position_mode: str | None,
+            rules_hash: str | None,
+            next_trade_cursor: str | None,
+        ) -> dict:
+            checkpoint = uow.recovery_checkpoints.add({
+                "run_id": run_id,
+                "strategy_id": None,
+                "account_id": "coin-m-main",
+                "symbol": "BTCUSD_PERP",
+                "reason": "STARTUP",
+                "status": "STARTED",
+                "recovery_epoch": 1,
+                "started_at_ms": NOW,
+            })
+            checkpoint = uow.recovery_checkpoints.advance(
+                checkpoint["checkpoint_id"],
+                status="SNAPSHOT_COMPLETE",
+                rest_server_time_ms=NOW + 1,
+                open_orders_observed_at_ms=NOW + 2,
+                position_observed_at_ms=NOW + 3,
+                margin_observed_at_ms=NOW + 4,
+                snapshot_observed_at_ms=NOW + 4,
+                position_mode=position_mode,
+                rules_hash=rules_hash,
+            )
+            checkpoint = uow.recovery_checkpoints.advance(
+                checkpoint["checkpoint_id"],
+                status="REPLAY_COMPLETE",
+                fills_through_ms=NOW + 5,
+                trades_complete=True,
+                next_trade_cursor=next_trade_cursor,
+            )
+            return uow.recovery_checkpoints.advance(
+                checkpoint["checkpoint_id"],
+                status="RECONCILED",
+            )
+
+        with ledger.unit_of_work() as uow:
+            missing_mode = build_reconciled(
+                uow,
+                "run-missing-mode",
+                position_mode=None,
+                rules_hash="rules-a",
+                next_trade_cursor=None,
+            )
+            with self.assertRaisesRegex(InvariantViolation, "position-mode"):
+                uow.recovery_checkpoints.complete(
+                    missing_mode["checkpoint_id"],
+                    status="COMPLETE",
+                    completed_at_ms=NOW + 6,
+                    orders_seen=0,
+                    fills_seen=0,
+                    mismatch_count=0,
+                )
+
+            open_cursor = build_reconciled(
+                uow,
+                "run-open-cursor",
+                position_mode="one_way",
+                rules_hash="rules-a",
+                next_trade_cursor="page-2",
+            )
+            with self.assertRaisesRegex(InvariantViolation, "exhausted trade cursor"):
+                uow.recovery_checkpoints.complete(
+                    open_cursor["checkpoint_id"],
+                    status="COMPLETE",
+                    completed_at_ms=NOW + 6,
+                    orders_seen=0,
+                    fills_seen=0,
+                    mismatch_count=0,
+                )
+
+            valid = build_reconciled(
+                uow,
+                "run-valid",
+                position_mode="one_way",
+                rules_hash="rules-a",
+                next_trade_cursor=None,
+            )
+            completed = uow.recovery_checkpoints.complete(
+                valid["checkpoint_id"],
+                status="COMPLETE",
+                completed_at_ms=NOW + 6,
+                orders_seen=0,
+                fills_seen=0,
+                mismatch_count=0,
+            )
+            self.assertEqual("COMPLETE", completed["status"])
 
 
 if __name__ == "__main__":

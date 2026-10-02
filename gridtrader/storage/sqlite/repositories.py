@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import sqlite3
 from decimal import Decimal
 from typing import Any, Dict, List, Mapping, Optional, Set, Tuple
@@ -112,6 +113,14 @@ class StrategyRepository(BaseRepository):
         "strategy_id", "account_id", "name", "symbol", "mode", "spacing_mode",
         "client_id_namespace", "status", "created_at_ms", "updated_at_ms",
     }
+
+    def add(self, record: Mapping[str, Any]) -> Record:
+        values = dict(record)
+        if "last_error" in values:
+            values["last_error"] = _safe_text(
+                values["last_error"], "strategy.last_error"
+            )
+        return super().add(values)
 
     def get_by_name(self, account_id: str, name: str) -> Optional[Record]:
         return _row(self.connection.execute(
@@ -323,6 +332,17 @@ class OrderRepository(BaseRepository):
         sql += " ORDER BY created_at_ms, local_order_id"
         return [dict(row) for row in self.connection.execute(sql, tuple(params))]
 
+    def list_for_strategy(
+        self, strategy_id: str, *, symbol: Optional[str] = None
+    ) -> List[Record]:
+        params: List[Any] = [strategy_id]
+        sql = "SELECT * FROM orders WHERE strategy_id = ?"
+        if symbol is not None:
+            sql += " AND symbol = ?"
+            params.append(symbol)
+        sql += " ORDER BY created_at_ms, local_order_id"
+        return [dict(row) for row in self.connection.execute(sql, tuple(params))]
+
     def mark_ack_unknown(self, local_order_id: str, updated_at_ms: int) -> Record:
         cursor = self.connection.execute(
             """
@@ -346,6 +366,13 @@ class OrderRepository(BaseRepository):
         updated_at_ms: int,
         exchange_order_id: Optional[str] = None,
         avg_fill_price: Optional[Any] = None,
+        side: Optional[str] = None,
+        position_side: Optional[str] = None,
+        price: Optional[Any] = None,
+        original_contracts: Optional[int] = None,
+        reduce_only: Optional[bool] = None,
+        order_type: Optional[str] = None,
+        time_in_force: Optional[str] = None,
         last_source: Optional[str] = None,
     ) -> Record:
         current = self.require(local_order_id)
@@ -390,9 +417,48 @@ class OrderRepository(BaseRepository):
             raise InvariantViolation("exchange order id is immutable once known")
         if (
             current["exchange_update_ms"] is not None
-            and exchange_update_ms < current["exchange_update_ms"]
-            and cumulative_filled_contracts == current["cumulative_filled_contracts"]
+            and exchange_update_ms <= current["exchange_update_ms"]
         ):
+            authoritative = {
+                "exchange_order_id": exchange_order_id,
+                "side": side,
+                "position_side": position_side,
+                "price": None if price is None else _decimal(price),
+                "quantity_contracts": original_contracts,
+                "reduce_only": (
+                    None if reduce_only is None else int(reduce_only)
+                ),
+                "order_type": order_type,
+                "time_in_force": time_in_force,
+            }
+            missing_identity = [
+                field for field, value in authoritative.items() if value is None
+            ]
+            differences = [
+                "exchange_status"
+                if current["exchange_status"] != exchange_status
+                else None,
+                "cumulative_filled_contracts"
+                if current["cumulative_filled_contracts"]
+                != cumulative_filled_contracts
+                else None,
+            ]
+            differences.extend(
+                field
+                for field, value in authoritative.items()
+                if value is not None and current[field] != value
+            )
+            conflicts = sorted(
+                set(missing_identity).union(
+                    difference for difference in differences if difference is not None
+                )
+            )
+            if conflicts:
+                raise InvariantViolation(
+                    "stale exchange observation cannot be proven equivalent: {}".format(
+                        ", ".join(conflicts)
+                    )
+                )
             return current
         local_state = "terminal" if exchange_status in TERMINAL_EXCHANGE_STATUSES else "active"
         terminal_at_ms = updated_at_ms if local_state == "terminal" else None
@@ -460,6 +526,60 @@ class FillRepository(BaseRepository):
             """,
             (account_id, symbol, binance_trade_id),
         ).fetchone())
+
+    def list_for_account_symbol(
+        self,
+        account_id: str,
+        symbol: str,
+    ) -> List[Record]:
+        return [
+            dict(row)
+            for row in self.connection.execute(
+                """
+                SELECT * FROM fills
+                 WHERE account_id = ? AND symbol = ?
+                 ORDER BY trade_time_ms, binance_trade_id
+                """,
+                (account_id, symbol),
+            )
+        ]
+
+    def list_for_strategy_symbol(
+        self,
+        strategy_id: str,
+        account_id: str,
+        symbol: str,
+    ) -> List[Record]:
+        """Return fills whose durable order ownership belongs to one strategy.
+
+        Position reconstruction must not use every account fill for a symbol:
+        another strategy (or an external/manual order) may trade the same
+        contract.  The order foreign key is the ownership proof.  The joined
+        position side also restores information that Binance trade rows carry
+        but the Phase-1 ``fills`` table did not persist directly.
+        """
+
+        return [
+            dict(row)
+            for row in self.connection.execute(
+                """
+                SELECT f.*,
+                       o.position_side AS position_side,
+                       o.strategy_id AS strategy_id,
+                       o.ownership AS ownership,
+                       o.client_order_id AS owned_client_order_id,
+                       o.exchange_order_id AS owned_exchange_order_id
+                  FROM fills AS f
+                  JOIN orders AS o ON o.local_order_id = f.order_id
+                 WHERE o.strategy_id = ?
+                   AND o.ownership = 'BOT'
+                   AND f.account_id = ?
+                   AND f.symbol = ?
+                 ORDER BY f.trade_time_ms, f.binance_trade_id
+                """,
+                (strategy_id, account_id, symbol),
+            )
+        ]
 
     def add_idempotent(self, record: Mapping[str, Any]) -> Tuple[Record, bool]:
         values = self._prepare(record)
@@ -529,6 +649,155 @@ class FillRepository(BaseRepository):
         return dict(existing)
 
 
+class ExchangeTradeObservationRepository(BaseRepository):
+    """Complete order-independent REST trade evidence for an account."""
+
+    table = "exchange_trade_observations"
+    primary_key = "binance_trade_id"
+    allowed_fields = {
+        "account_id", "symbol", "binance_trade_id", "exchange_order_id",
+        "client_order_id", "side", "position_side", "price",
+        "fill_contracts", "commission", "commission_asset", "realized_pnl",
+        "is_maker", "trade_time_ms", "first_checkpoint_id",
+        "last_checkpoint_id", "first_observed_at_ms", "last_observed_at_ms",
+        "payload_hash",
+    }
+    required_fields = allowed_fields.difference(
+        {"client_order_id", "is_maker", "payload_hash"}
+    )
+    financial_fields = {"price", "commission", "realized_pnl"}
+    _fact_fields = {
+        "account_id", "symbol", "binance_trade_id", "exchange_order_id",
+        "side", "position_side", "price", "fill_contracts", "commission",
+        "commission_asset", "realized_pnl", "trade_time_ms",
+    }
+
+    def get(self, record_id: Any) -> Optional[Record]:
+        """Resolve only the full Binance trade scope, never a bare trade ID."""
+
+        if (
+            not isinstance(record_id, tuple)
+            or len(record_id) != 3
+            or not all(isinstance(value, str) and value for value in record_id)
+        ):
+            raise ValueError(
+                "exchange trade key must be (account_id, symbol, binance_trade_id)"
+            )
+        return self.get_by_trade_id(*record_id)
+
+    def require(self, record_id: Any) -> Record:
+        record = self.get(record_id)
+        if record is None:
+            raise NotFound("exchange trade observation was not found")
+        return record
+
+    def add(self, record: Mapping[str, Any]) -> Record:
+        del record
+        raise NotImplementedError("use record_observation for exchange trade facts")
+
+    def get_by_trade_id(
+        self,
+        account_id: str,
+        symbol: str,
+        binance_trade_id: str,
+    ) -> Optional[Record]:
+        return _row(self.connection.execute(
+            """
+            SELECT * FROM exchange_trade_observations
+             WHERE account_id = ? AND symbol = ? AND binance_trade_id = ?
+            """,
+            (account_id, symbol, binance_trade_id),
+        ).fetchone())
+
+    def record_observation(
+        self,
+        record: Mapping[str, Any],
+    ) -> Tuple[Record, bool]:
+        values = self._prepare(record)
+        canonical_fact = json.dumps(
+            {field: values.get(field) for field in sorted(self._fact_fields)},
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        values["payload_hash"] = hashlib.sha256(
+            canonical_fact.encode("utf-8")
+        ).hexdigest()
+        existing = self.get_by_trade_id(
+            str(values["account_id"]),
+            str(values["symbol"]),
+            str(values["binance_trade_id"]),
+        )
+        if existing is None:
+            columns = list(values)
+            try:
+                self.connection.execute(
+                    "INSERT INTO exchange_trade_observations ({}) VALUES ({})".format(
+                        ", ".join(columns),
+                        ", ".join("?" for _ in columns),
+                    ),
+                    tuple(values[column] for column in columns),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise ConstraintViolation(str(exc)) from exc
+            return (
+                self.get_by_trade_id(
+                    str(values["account_id"]),
+                    str(values["symbol"]),
+                    str(values["binance_trade_id"]),
+                ),
+                True,
+            )  # type: ignore[return-value]
+
+        conflicts = [
+            field
+            for field in self._fact_fields
+            if existing[field] != values[field]
+        ]
+        if (
+            existing["client_order_id"] is not None
+            and values.get("client_order_id") is not None
+            and existing["client_order_id"] != values["client_order_id"]
+        ):
+            conflicts.append("client_order_id")
+        if (
+            existing["is_maker"] is not None
+            and values.get("is_maker") is not None
+            and existing["is_maker"] != values["is_maker"]
+        ):
+            conflicts.append("is_maker")
+        if conflicts:
+            raise InvariantViolation(
+                "exchange trade observation conflicts: "
+                + ", ".join(sorted(set(conflicts)))
+            )
+        self.connection.execute(
+            """
+            UPDATE exchange_trade_observations
+               SET client_order_id = COALESCE(client_order_id, ?),
+                   is_maker = COALESCE(is_maker, ?),
+                   last_checkpoint_id = ?, last_observed_at_ms = ?,
+                   payload_hash = ?
+             WHERE account_id = ? AND symbol = ? AND binance_trade_id = ?
+            """,
+            (
+                values.get("client_order_id"),
+                values.get("is_maker"),
+                values["last_checkpoint_id"],
+                values["last_observed_at_ms"],
+                values["payload_hash"],
+                values["account_id"],
+                values["symbol"],
+                values["binance_trade_id"],
+            ),
+        )
+        return self.get_by_trade_id(
+            str(values["account_id"]),
+            str(values["symbol"]),
+            str(values["binance_trade_id"]),
+        ), False  # type: ignore[return-value]
+
+
 class PositionRepository:
     financial_fields = {
         "entry_price",
@@ -580,7 +849,12 @@ class PositionRepository:
         sql = """
             INSERT INTO positions ({columns}) VALUES ({placeholders})
             ON CONFLICT(account_id, symbol, position_side) DO UPDATE SET {assignments}
-            WHERE excluded.exchange_update_ms > positions.exchange_update_ms
+            WHERE excluded.exchange_update_ms >= positions.exchange_update_ms
+               OR (
+                    excluded.source = 'REST'
+                AND excluded.quantity_contracts = 0
+                AND excluded.observed_at_ms >= positions.observed_at_ms
+               )
         """.format(
             columns=", ".join(columns),
             placeholders=", ".join("?" for _ in columns),
@@ -603,6 +877,172 @@ class PositionRepository:
         )]
 
 
+class InstrumentRulesRepository(BaseRepository):
+    table = "instrument_rules"
+    primary_key = "instrument_rule_id"
+    allowed_fields = {
+        "instrument_rule_id", "symbol", "pair", "contract_type", "status",
+        "contract_size", "margin_asset", "tick_size", "quantity_step",
+        "min_qty", "max_qty", "min_price", "max_price",
+        "supported_order_types_json", "observed_at_ms", "payload_hash",
+        "rules_hash",
+    }
+    required_fields = {
+        "symbol", "pair", "contract_type", "status", "contract_size",
+        "margin_asset", "tick_size", "quantity_step", "min_qty",
+        "supported_order_types_json", "observed_at_ms", "payload_hash",
+        "rules_hash",
+    }
+    financial_fields = {"contract_size", "tick_size", "min_price", "max_price"}
+
+    def latest_for_symbol(self, symbol: str) -> Optional[Record]:
+        return _row(self.connection.execute(
+            """
+            SELECT * FROM instrument_rules
+             WHERE symbol = ?
+             ORDER BY observed_at_ms DESC, instrument_rule_id DESC LIMIT 1
+            """,
+            (symbol,),
+        ).fetchone())
+
+    def record_observation(self, record: Mapping[str, Any]) -> Tuple[Record, bool]:
+        values = self._prepare(record)
+        values.pop("instrument_rule_id", None)
+        existing = _row(self.connection.execute(
+            "SELECT * FROM instrument_rules WHERE symbol = ? AND rules_hash = ?",
+            (values["symbol"], values["rules_hash"]),
+        ).fetchone())
+        if existing is not None:
+            if values["observed_at_ms"] > existing["observed_at_ms"]:
+                self.connection.execute(
+                    """
+                    UPDATE instrument_rules SET observed_at_ms = ?, payload_hash = ?
+                     WHERE instrument_rule_id = ?
+                    """,
+                    (
+                        values["observed_at_ms"],
+                        values["payload_hash"],
+                        existing["instrument_rule_id"],
+                    ),
+                )
+                existing = self.require(existing["instrument_rule_id"])
+            return existing, False
+        columns = list(values)
+        try:
+            cursor = self.connection.execute(
+                "INSERT INTO instrument_rules ({}) VALUES ({})".format(
+                    ", ".join(columns), ", ".join("?" for _ in columns)
+                ),
+                tuple(values[column] for column in columns),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise ConstraintViolation(str(exc)) from exc
+        return self.require(cursor.lastrowid), True
+
+
+class PositionModeObservationRepository(BaseRepository):
+    table = "position_mode_observations"
+    primary_key = "position_mode_observation_id"
+    allowed_fields = {
+        "position_mode_observation_id", "account_id", "mode", "observed_at_ms",
+        "checkpoint_id", "source",
+    }
+    required_fields = {"account_id", "mode", "observed_at_ms", "checkpoint_id"}
+
+    def latest_for_account(self, account_id: str) -> Optional[Record]:
+        return _row(self.connection.execute(
+            """
+            SELECT * FROM position_mode_observations
+             WHERE account_id = ?
+             ORDER BY observed_at_ms DESC, position_mode_observation_id DESC LIMIT 1
+            """,
+            (account_id,),
+        ).fetchone())
+
+    def add_idempotent(self, record: Mapping[str, Any]) -> Tuple[Record, bool]:
+        values = self._prepare(record)
+        values.pop("position_mode_observation_id", None)
+        existing = _row(self.connection.execute(
+            """
+            SELECT * FROM position_mode_observations
+             WHERE checkpoint_id = ? AND account_id = ?
+            """,
+            (values["checkpoint_id"], values["account_id"]),
+        ).fetchone())
+        if existing is not None:
+            if existing["mode"] != values["mode"]:
+                raise InvariantViolation(
+                    "position mode changed within one recovery checkpoint"
+                )
+            return existing, False
+        columns = list(values)
+        cursor = self.connection.execute(
+            "INSERT INTO position_mode_observations ({}) VALUES ({})".format(
+                ", ".join(columns), ", ".join("?" for _ in columns)
+            ),
+            tuple(values[column] for column in columns),
+        )
+        return self.require(cursor.lastrowid), True
+
+
+class ExchangeObservationRepository(BaseRepository):
+    table = "exchange_observations"
+    primary_key = "exchange_observation_id"
+    allowed_fields = {
+        "exchange_observation_id", "checkpoint_id", "observation_type",
+        "account_id", "symbol", "observed_at_ms", "server_time_ms",
+        "item_count", "complete", "next_cursor", "pagination_watermark",
+        "payload_hash", "metadata_json",
+    }
+    required_fields = {
+        "checkpoint_id", "observation_type", "account_id", "observed_at_ms",
+        "payload_hash", "metadata_json",
+    }
+
+    def append_idempotent(self, record: Mapping[str, Any]) -> Tuple[Record, bool]:
+        values = self._prepare(record)
+        values.pop("exchange_observation_id", None)
+        metadata = values["metadata_json"]
+        values["metadata_json"] = (
+            _safe_json(metadata)
+            if not isinstance(metadata, str)
+            else _safe_json(json.loads(metadata))
+        )
+        existing = _row(self.connection.execute(
+            """
+            SELECT * FROM exchange_observations
+             WHERE checkpoint_id = ? AND observation_type = ?
+               AND symbol IS ? AND server_time_ms IS ?
+               AND pagination_watermark IS ?
+               AND next_cursor IS ? AND payload_hash = ?
+            """,
+            (
+                values["checkpoint_id"], values["observation_type"],
+                values.get("symbol"), values.get("server_time_ms"),
+                values.get("pagination_watermark"),
+                values.get("next_cursor"),
+                values["payload_hash"],
+            ),
+        ).fetchone())
+        if existing is not None:
+            comparable = {
+                "item_count", "complete", "next_cursor", "payload_hash", "metadata_json"
+            }
+            if any(existing[field] != values.get(field, existing[field]) for field in comparable):
+                raise InvariantViolation(
+                    "exchange observation identity was reused with different evidence"
+                )
+            return existing, False
+        columns = list(values)
+        cursor = self.connection.execute(
+            "INSERT INTO exchange_observations ({}) VALUES ({})".format(
+                ", ".join(columns), ", ".join("?" for _ in columns)
+            ),
+            tuple(values[column] for column in columns),
+        )
+        return self.require(cursor.lastrowid), True
+
+
 class RecoveryCheckpointRepository(BaseRepository):
     table = "recovery_checkpoints"
     primary_key = "checkpoint_id"
@@ -612,7 +1052,9 @@ class RecoveryCheckpointRepository(BaseRepository):
         "position_observed_at_ms", "margin_observed_at_ms", "fills_from_ms", "fills_through_ms",
         "last_binance_trade_id", "ws_buffer_from_ms", "ws_buffer_through_ms",
         "orders_seen", "fills_seen", "mismatch_count", "started_at_ms",
-        "completed_at_ms", "error",
+        "completed_at_ms", "error", "recovery_epoch", "snapshot_observed_at_ms",
+        "trades_complete", "next_trade_cursor", "pagination_watermark",
+        "position_mode", "rules_hash",
     }
     required_fields = {"run_id", "account_id", "reason", "status", "started_at_ms"}
 
@@ -634,6 +1076,45 @@ class RecoveryCheckpointRepository(BaseRepository):
             raise ConstraintViolation(str(exc)) from exc
         return self.require(cursor.lastrowid)
 
+    def latest_for_strategy(self, strategy_id: str) -> Optional[Record]:
+        return _row(self.connection.execute(
+            """
+            SELECT * FROM recovery_checkpoints
+             WHERE strategy_id = ?
+             ORDER BY started_at_ms DESC, checkpoint_id DESC LIMIT 1
+            """,
+            (strategy_id,),
+        ).fetchone())
+
+    def record_pagination_progress(
+        self,
+        checkpoint_id: int,
+        *,
+        next_trade_cursor: Optional[str],
+        pagination_watermark: Optional[str],
+        fills_through_ms: Optional[int],
+        trades_complete: bool,
+    ) -> Record:
+        cursor = self.connection.execute(
+            """
+            UPDATE recovery_checkpoints
+               SET next_trade_cursor = ?, pagination_watermark = ?,
+                   fills_through_ms = ?, trades_complete = ?
+             WHERE checkpoint_id = ?
+               AND status NOT IN ('COMPLETE', 'FAILED', 'BLOCKED')
+            """,
+            (
+                next_trade_cursor,
+                pagination_watermark,
+                fills_through_ms,
+                int(trades_complete),
+                checkpoint_id,
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise InvariantViolation("checkpoint is missing or no longer writable")
+        return self.require(checkpoint_id)
+
     def advance(
         self,
         checkpoint_id: int,
@@ -648,6 +1129,12 @@ class RecoveryCheckpointRepository(BaseRepository):
         last_binance_trade_id: Optional[str] = None,
         ws_buffer_from_ms: Optional[int] = None,
         ws_buffer_through_ms: Optional[int] = None,
+        snapshot_observed_at_ms: Optional[int] = None,
+        trades_complete: Optional[bool] = None,
+        next_trade_cursor: Optional[str] = None,
+        pagination_watermark: Optional[str] = None,
+        position_mode: Optional[str] = None,
+        rules_hash: Optional[str] = None,
     ) -> Record:
         current = self.require(checkpoint_id)
         expected_next = {
@@ -671,6 +1158,14 @@ class RecoveryCheckpointRepository(BaseRepository):
             "last_binance_trade_id": last_binance_trade_id,
             "ws_buffer_from_ms": ws_buffer_from_ms,
             "ws_buffer_through_ms": ws_buffer_through_ms,
+            "snapshot_observed_at_ms": snapshot_observed_at_ms,
+            "trades_complete": (
+                None if trades_complete is None else int(trades_complete)
+            ),
+            "next_trade_cursor": next_trade_cursor,
+            "pagination_watermark": pagination_watermark,
+            "position_mode": position_mode,
+            "rules_hash": rules_hash,
         }
         merged = {
             field: value if value is not None else current[field]
@@ -690,6 +1185,20 @@ class RecoveryCheckpointRepository(BaseRepository):
             )
         if status == "REPLAY_COMPLETE" and merged["fills_through_ms"] is None:
             raise InvariantViolation("replay completion requires a fills high-water mark")
+        if (
+            status == "REPLAY_COMPLETE"
+            and current["recovery_epoch"] > 0
+            and trades_complete is not True
+        ):
+            raise InvariantViolation(
+                "Phase-2 replay completion requires explicit complete pagination"
+            )
+        if status == "REPLAY_COMPLETE" and trades_complete is False:
+            raise InvariantViolation("replay completion requires complete pagination")
+        if status == "REPLAY_COMPLETE" and trades_complete is None:
+            # Backward-compatible inference for Phase-1 callers.  Phase-2
+            # RecoveryManager always passes explicit completeness evidence.
+            merged["trades_complete"] = 1
         assignments = ", ".join(
             "{} = ?".format(field) for field in observations
         )
@@ -730,9 +1239,25 @@ class RecoveryCheckpointRepository(BaseRepository):
                 "margin_observed_at_ms",
                 "fills_through_ms",
             )
+            if current["recovery_epoch"] > 0:
+                required_evidence += ("snapshot_observed_at_ms", "rules_hash")
             if any(current[field] is None for field in required_evidence):
                 raise InvariantViolation(
                     "complete checkpoint is missing mandatory REST evidence"
+                )
+            if current["recovery_epoch"] > 0 and (
+                not current["position_mode"] or not current["rules_hash"]
+            ):
+                raise InvariantViolation(
+                    "complete checkpoint is missing position-mode or rules evidence"
+                )
+            if current["trades_complete"] != 1:
+                raise InvariantViolation(
+                    "complete checkpoint requires complete trade pagination"
+                )
+            if current["next_trade_cursor"] is not None:
+                raise InvariantViolation(
+                    "complete checkpoint requires an exhausted trade cursor"
                 )
         error = _safe_text(error, "checkpoint.error")
         cursor = self.connection.execute(
@@ -757,6 +1282,25 @@ class RecoveryCheckpointRepository(BaseRepository):
             """
             SELECT * FROM recovery_checkpoints
              WHERE strategy_id = ? AND status = 'COMPLETE'
+             ORDER BY completed_at_ms DESC, checkpoint_id DESC LIMIT 1
+            """,
+            (strategy_id,),
+        ).fetchone())
+
+    def latest_phase2_replay_complete(self, strategy_id: str) -> Optional[Record]:
+        """Return only a checkpoint that proves a complete Phase-2 REST replay."""
+
+        return _row(self.connection.execute(
+            """
+            SELECT * FROM recovery_checkpoints
+             WHERE strategy_id = ? AND status = 'COMPLETE'
+               AND recovery_epoch > 0
+               AND trades_complete = 1
+               AND next_trade_cursor IS NULL
+               AND fills_through_ms IS NOT NULL
+               AND snapshot_observed_at_ms IS NOT NULL
+               AND position_mode IS NOT NULL
+               AND rules_hash IS NOT NULL
              ORDER BY completed_at_ms DESC, checkpoint_id DESC LIMIT 1
             """,
             (strategy_id,),
@@ -920,21 +1464,6 @@ class StrategyLeaseRepository:
                 raise ConstraintViolation(str(exc)) from exc
             return self.get(strategy_id)  # type: ignore[return-value]
 
-        if (
-            existing["run_id"] == run_id
-            and existing["released"] == 0
-            and existing["expires_at_ms"] > now_ms
-        ):
-            self.connection.execute(
-                """
-                UPDATE strategy_leases
-                   SET renewed_at_ms = ?, expires_at_ms = ?
-                 WHERE strategy_id = ? AND run_id = ?
-                """,
-                (now_ms, expires_at_ms, strategy_id, run_id),
-            )
-            return self.get(strategy_id)  # type: ignore[return-value]
-
         if existing["released"] == 0 and existing["expires_at_ms"] > now_ms:
             raise LeaseUnavailable(
                 "strategy {} is leased by run {}".format(strategy_id, existing["run_id"])
@@ -956,6 +1485,61 @@ class StrategyLeaseRepository:
         )
         if cursor.rowcount != 1:
             raise LeaseUnavailable("strategy lease changed concurrently")
+        return self.get(strategy_id)  # type: ignore[return-value]
+
+    def require_owned(
+        self,
+        *,
+        strategy_id: str,
+        run_id: str,
+        fencing_token: int,
+        now_ms: int,
+    ) -> Record:
+        lease = self.get(strategy_id)
+        if (
+            lease is None
+            or lease["run_id"] != run_id
+            or lease["fencing_token"] != fencing_token
+            or lease["released"] != 0
+            or lease["expires_at_ms"] <= now_ms
+        ):
+            raise LeaseUnavailable(
+                "strategy lease is missing, expired, or fenced by another owner"
+            )
+        return lease
+
+    def renew(
+        self,
+        *,
+        strategy_id: str,
+        run_id: str,
+        fencing_token: int,
+        now_ms: int,
+        expires_at_ms: int,
+    ) -> Record:
+        if expires_at_ms <= now_ms:
+            raise ValueError("lease expiry must be later than renewal time")
+        cursor = self.connection.execute(
+            """
+            UPDATE strategy_leases
+               SET renewed_at_ms = ?, expires_at_ms = ?
+             WHERE strategy_id = ? AND run_id = ? AND fencing_token = ?
+               AND released = 0 AND expires_at_ms > ? AND renewed_at_ms <= ?
+            """,
+            (
+                now_ms,
+                expires_at_ms,
+                strategy_id,
+                run_id,
+                fencing_token,
+                now_ms,
+                now_ms,
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise LeaseUnavailable(
+                "strategy lease is missing, expired, or fenced by another owner"
+            )
         return self.get(strategy_id)  # type: ignore[return-value]
 
     def release(self, *, strategy_id: str, run_id: str, fencing_token: int) -> None:
@@ -985,18 +1569,26 @@ class SQLiteRepositories:
         self.events = EventRepository(connection)
         self.bot_runs = BotRunRepository(connection)
         self.strategy_leases = StrategyLeaseRepository(connection)
+        self.instrument_rules = InstrumentRulesRepository(connection)
+        self.position_mode_observations = PositionModeObservationRepository(connection)
+        self.exchange_observations = ExchangeObservationRepository(connection)
+        self.exchange_trade_observations = ExchangeTradeObservationRepository(connection)
 
 
 __all__ = [
     "BotRunRepository",
     "EventRepository",
+    "ExchangeTradeObservationRepository",
     "FillRepository",
     "GridGenerationRepository",
     "GridLevelRepository",
+    "InstrumentRulesRepository",
     "OrderRepository",
     "PositionRepository",
+    "PositionModeObservationRepository",
     "RecoveryCheckpointRepository",
     "SQLiteRepositories",
     "StrategyLeaseRepository",
     "StrategyRepository",
+    "ExchangeObservationRepository",
 ]

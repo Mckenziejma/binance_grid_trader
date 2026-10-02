@@ -17,7 +17,33 @@ _SENSITIVE_KEY = re.compile(
     r"(?:api[_-]?secret|api[_-]?key|secret[_-]?key|listen[_-]?key|listenkey|signature)",
     re.IGNORECASE,
 )
-_SIGNED_URL = re.compile(r"(?:[?&]signature=|wss?://[^\s]*listenkey)", re.IGNORECASE)
+_PRIVATE_WEBSOCKET_URL = re.compile(
+    r"wss?://[^\s]*listen[_-]?key",
+    re.IGNORECASE,
+)
+_SENSITIVE_TEXT_VALUE = re.compile(
+    r"""
+    (?P<key>
+        [\"']?
+        (?:
+            signature
+            | api[_-]?key
+            | api[_-]?secret
+            | secret[_-]?key
+            | listen[_-]?key
+            | x-mbx-apikey
+        )
+        [\"']?
+    )
+    \s*(?:=|:)\s*
+    (?:
+        \"(?P<double_quoted_value>[^\"]*)\"
+        | '(?P<single_quoted_value>[^']*)'
+        | (?P<unquoted_value>[^&\s,}\]]+)
+    )
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
 
 
 def decimal_text(value: Union[str, int, Decimal]) -> str:
@@ -50,9 +76,25 @@ def ensure_safe_text(value: Optional[str], field_name: str = "text") -> Optional
     if value is None:
         return None
     text = str(value)
-    if _SIGNED_URL.search(text):
-        raise SensitiveDataError("{} contains a signed or private URL".format(field_name))
-    return text
+    if _PRIVATE_WEBSOCKET_URL.search(text):
+        raise SensitiveDataError("{} contains a private websocket URL".format(field_name))
+    for match in _SENSITIVE_TEXT_VALUE.finditer(text):
+        sensitive_value = next(
+            value
+            for value in (
+                match.group("double_quoted_value"),
+                match.group("single_quoted_value"),
+                match.group("unquoted_value"),
+            )
+            if value is not None
+        )
+        if sensitive_value.casefold() != "<redacted>":
+            raise SensitiveDataError("{} contains sensitive material".format(field_name))
+    # Phase-1 tables also have conservative SQL CHECK constraints that reject
+    # several sensitive *key names* even when their values are already
+    # redacted.  Canonicalize the entire key/value pair so every repository
+    # and the database enforce the same no-secret boundary.
+    return _SENSITIVE_TEXT_VALUE.sub("<redacted>", text)
 
 
 def safe_json(payload: Any) -> str:

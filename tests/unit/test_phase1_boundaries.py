@@ -14,6 +14,7 @@ NEW_PACKAGE_ROOTS = (
     REPOSITORY_ROOT / "gridtrader" / "exchange",
     REPOSITORY_ROOT / "gridtrader" / "grid",
     REPOSITORY_ROOT / "gridtrader" / "orders",
+    REPOSITORY_ROOT / "gridtrader" / "recovery",
     REPOSITORY_ROOT / "gridtrader" / "storage",
 )
 FORBIDDEN_IMPORT_PREFIXES = (
@@ -46,6 +47,22 @@ class Phase1BoundaryTests(unittest.TestCase):
             for path in package_root.rglob("*.py"):
                 for module in imported_modules(path):
                     if module.startswith(FORBIDDEN_IMPORT_PREFIXES):
+                        official_boundary = (
+                            path
+                            == REPOSITORY_ROOT
+                            / "gridtrader"
+                            / "exchange"
+                            / "binance_coinm"
+                            / "connector.py"
+                            and module.startswith(
+                                (
+                                    "binance_common",
+                                    "binance_sdk_derivatives_trading_coin_futures",
+                                )
+                            )
+                        )
+                        if official_boundary:
+                            continue
                         violations.append(f"{path.relative_to(REPOSITORY_ROOT)} -> {module}")
         self.assertEqual([], violations)
 

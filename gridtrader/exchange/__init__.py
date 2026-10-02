@@ -1,5 +1,7 @@
 """Exchange-neutral models and ports."""
 
+from .fake import FakeExchangeAdapter
+from .fake_backend import FakeExchangeBackend, FakeFault, FakeFaultKind
 from .models import (
     CancelOrder,
     ExchangeFill,
@@ -7,17 +9,29 @@ from .models import (
     ExchangeOrderSnapshot,
     ExchangePosition,
     InstrumentRules,
+    MarginAccountSnapshot,
+    PositionMode,
+    PositionModeSnapshot,
     SubmitLimitOrder,
+    TradePage,
 )
 from .ports import ExchangePort
 
 __all__ = [
     "CancelOrder",
     "ExchangeFill",
+    "FakeExchangeAdapter",
+    "FakeExchangeBackend",
+    "FakeFault",
+    "FakeFaultKind",
     "ExchangeMarginBalance",
     "ExchangeOrderSnapshot",
     "ExchangePort",
     "ExchangePosition",
     "InstrumentRules",
+    "MarginAccountSnapshot",
+    "PositionMode",
+    "PositionModeSnapshot",
     "SubmitLimitOrder",
+    "TradePage",
 ]

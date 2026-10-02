@@ -9,12 +9,14 @@ from typing import Optional, Protocol, Sequence, runtime_checkable
 
 from .models import (
     CancelOrder,
-    ExchangeFill,
     ExchangeMarginBalance,
     ExchangeOrderSnapshot,
     ExchangePosition,
     InstrumentRules,
+    MarginAccountSnapshot,
+    PositionModeSnapshot,
     SubmitLimitOrder,
+    TradePage,
 )
 
 
@@ -42,7 +44,17 @@ class ExchangePort(Protocol):
         raise NotImplementedError
 
     def get_margin_balances(self) -> Sequence[ExchangeMarginBalance]:
-        """Return current authoritative margin balances."""
+        """Return current authoritative balances (Phase 1 compatibility)."""
+
+        raise NotImplementedError
+
+    def get_margin_account_snapshot(self) -> MarginAccountSnapshot:
+        """Return one coherent margin-account observation."""
+
+        raise NotImplementedError
+
+    def get_position_mode(self) -> PositionModeSnapshot:
+        """Read the account-level one-way/hedge setting without changing it."""
 
         raise NotImplementedError
 
@@ -50,19 +62,32 @@ class ExchangePort(Protocol):
         self,
         symbol: str,
         *,
-        start_time: Optional[datetime] = None,
+        cursor: Optional[str] = None,
+        from_time: Optional[datetime] = None,
         end_time: Optional[datetime] = None,
-        from_trade_id: Optional[str] = None,
         limit: Optional[int] = None,
-    ) -> Sequence[ExchangeFill]:
-        """Return real fills for replay and gap recovery."""
+    ) -> TradePage:
+        """Return a resumable page and explicit completeness evidence."""
 
         raise NotImplementedError
 
     def get_order_by_client_id(
         self, symbol: str, client_order_id: str
-    ) -> Optional[ExchangeOrderSnapshot]:
-        """Resolve an owned order, especially one in ACK_UNKNOWN."""
+    ) -> ExchangeOrderSnapshot:
+        """Resolve an order or raise ExchangeNotFoundError.
+
+        Transport failure must never be represented as a missing order.
+        """
+
+        raise NotImplementedError
+
+    def get_order_by_exchange_id(
+        self, symbol: str, exchange_order_id: str
+    ) -> ExchangeOrderSnapshot:
+        """Resolve an order by exchange identity or raise ExchangeNotFoundError.
+
+        Transport failure must never be represented as a missing order.
+        """
 
         raise NotImplementedError
 

@@ -109,6 +109,19 @@ cannot make the current recovery attempt ready.
 
 ## WebSocket disconnect and gap recovery
 
+Phase 2 is deliberately read-only and does not open a private user stream.
+Its `READY` therefore means only that one bounded, overlapping REST recovery
+completed and committed; it is not a continuously fenced account view and it
+never grants trading permission.  Phase 3 must add the private-stream
+subscribe/buffer/drain barrier described below, plus a runtime fencing lease,
+before any exchange write can be enabled.
+
+The bounded Phase-2 recovery closes its trade-history replay with one final
+overlapping `userTrades` pass, then re-reads position mode, instrument rules,
+open orders, positions, and margin. Any difference from the account facts read
+immediately before that closing replay blocks `READY`; reconciliation and the
+checkpoint use only the post-closing account facts.
+
 - Loss of the private user stream immediately moves a `READY` process to
   `DEGRADED` and prevents new order submissions. Risk-reducing actions may be
   allowed only by an explicit policy and must still be reconciled.

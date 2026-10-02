@@ -15,6 +15,9 @@ dev = [
     "pytest>=8.3,<9",
     "ruff>=0.9,<1",
 ]
+live = [
+    "binance-sdk-derivatives-trading-coin-futures==13.3.0",
+]
 
 [tool.setuptools.packages.find]
 include = [
@@ -23,6 +26,7 @@ include = [
     "gridtrader.exchange*",
     "gridtrader.grid*",
     "gridtrader.orders*",
+    "gridtrader.recovery*",
     "gridtrader.storage*",
 ]
 
@@ -44,6 +48,7 @@ packages = [
     "gridtrader.exchange",
     "gridtrader.grid",
     "gridtrader.orders",
+    "gridtrader.recovery",
     "gridtrader.storage",
 ]
 

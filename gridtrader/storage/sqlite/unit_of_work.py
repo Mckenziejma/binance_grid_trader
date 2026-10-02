@@ -29,9 +29,16 @@ class SQLiteUnitOfWork:
         if self.connection is not None or self._finished:
             raise RuntimeError("unit of work instances are single-use")
         self.connection = self.database.connect()
-        self.connection.execute("BEGIN IMMEDIATE" if self.immediate else "BEGIN")
-        self.repositories = SQLiteRepositories(self.connection)
-        self._bind_repositories(self.repositories)
+        try:
+            self.connection.execute("BEGIN IMMEDIATE" if self.immediate else "BEGIN")
+            self.repositories = SQLiteRepositories(self.connection)
+            self._bind_repositories(self.repositories)
+        except BaseException:
+            self.connection.close()
+            self.connection = None
+            self.repositories = None
+            self._finished = True
+            raise
         return self
 
     def _bind_repositories(self, repositories: SQLiteRepositories) -> None:
@@ -45,6 +52,10 @@ class SQLiteUnitOfWork:
         self.events = repositories.events
         self.bot_runs = repositories.bot_runs
         self.strategy_leases = repositories.strategy_leases
+        self.instrument_rules = repositories.instrument_rules
+        self.position_mode_observations = repositories.position_mode_observations
+        self.exchange_observations = repositories.exchange_observations
+        self.exchange_trade_observations = repositories.exchange_trade_observations
 
     def commit(self) -> None:
         connection = self._require_connection()

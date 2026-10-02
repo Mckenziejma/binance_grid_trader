@@ -81,6 +81,8 @@ class ExchangeOrderSnapshotTests(unittest.TestCase):
         )
         self.assertEqual(partial.remaining_contracts, 6)
         self.assertFalse(partial.is_terminal)
+        self.assertEqual(partial.order_type, "LIMIT")
+        self.assertEqual(partial.time_in_force, "GTC")
 
         filled = ExchangeOrderSnapshot(
             symbol="BTCUSD_PERP",
@@ -123,6 +125,12 @@ class ExchangeOrderSnapshotTests(unittest.TestCase):
                 status=ExchangeOrderStatus.NEW,
                 filled_contracts=1,
             )
+        with self.assertRaises(DomainValidationError):
+            ExchangeOrderSnapshot(
+                **common,
+                status=ExchangeOrderStatus.REJECTED,
+                filled_contracts=1,
+            )
 
     def test_enum_and_bool_fields_are_strictly_typed(self) -> None:
         base = {
@@ -148,6 +156,10 @@ class ExchangeOrderSnapshotTests(unittest.TestCase):
             ExchangeOrderSnapshot(
                 **{**base, "reduce_only": 1}  # type: ignore[arg-type]
             )
+        for field_name in ("order_type", "time_in_force"):
+            with self.subTest(field_name=field_name):
+                with self.assertRaises(DomainValidationError):
+                    ExchangeOrderSnapshot(**{**base, field_name: ""})
 
 
 class ExchangeFillAndPositionTests(unittest.TestCase):
@@ -289,6 +301,7 @@ class ExchangePortContractTests(unittest.TestCase):
             "get_margin_balances",
             "get_user_trades",
             "get_order_by_client_id",
+            "get_order_by_exchange_id",
             "submit_limit_order",
             "cancel_order",
         }

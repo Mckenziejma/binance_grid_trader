@@ -20,12 +20,14 @@ class MigrationTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
 
-    def test_empty_database_gets_all_eleven_tables_and_pragmas(self) -> None:
+    def test_empty_database_gets_all_phase2_tables_and_pragmas(self) -> None:
         ledger = new_ledger(self.db_path)
         expected = {
             "strategies", "grid_generations", "grid_levels", "orders", "fills",
             "positions", "recovery_checkpoints", "events", "schema_migrations",
             "bot_runs", "strategy_leases",
+            "instrument_rules", "position_mode_observations",
+            "exchange_observations", "exchange_trade_observations",
         }
         connection = ledger.database.connect()
         try:
@@ -46,7 +48,7 @@ class MigrationTests(unittest.TestCase):
                     "SELECT version FROM schema_migrations ORDER BY version"
                 )
             ]
-            self.assertEqual([1, 2], versions)
+            self.assertEqual([1, 2, 3], versions)
         finally:
             connection.close()
 
@@ -56,7 +58,7 @@ class MigrationTests(unittest.TestCase):
         connection = ledger.database.connect()
         try:
             count = connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0]
-            self.assertEqual(2, count)
+            self.assertEqual(3, count)
         finally:
             connection.close()
 

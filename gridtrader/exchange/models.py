@@ -77,6 +77,10 @@ class InstrumentRules:
     max_contracts: Optional[int]
     min_price: Optional[Decimal] = None
     max_price: Optional[Decimal] = None
+    pair: Optional[str] = None
+    supported_order_types: tuple[str, ...] = ()
+    observed_at: Optional[datetime] = None
+    rules_hash: Optional[str] = None
 
     def __post_init__(self) -> None:
         for field_name in (
@@ -114,6 +118,49 @@ class InstrumentRules:
             and self.min_price >= self.max_price
         ):
             raise DomainValidationError("min_price must be less than max_price")
+        if self.pair is not None:
+            object.__setattr__(self, "pair", require_non_empty(self.pair, "pair"))
+        if not isinstance(self.supported_order_types, tuple):
+            raise DomainValidationError("supported_order_types must be tuple")
+        normalized_order_types = tuple(
+            require_non_empty(value, "supported_order_types item")
+            for value in self.supported_order_types
+        )
+        if len(normalized_order_types) != len(set(normalized_order_types)):
+            raise DomainValidationError("supported_order_types must not contain duplicates")
+        object.__setattr__(self, "supported_order_types", normalized_order_types)
+        if self.observed_at is not None:
+            object.__setattr__(
+                self,
+                "observed_at",
+                require_utc(self.observed_at, "observed_at"),
+            )
+        if self.rules_hash is not None:
+            object.__setattr__(
+                self,
+                "rules_hash",
+                require_non_empty(self.rules_hash, "rules_hash"),
+            )
+
+    @property
+    def tick_size(self) -> Decimal:
+        """Binance terminology alias for the exchange-neutral price tick."""
+
+        return self.price_tick
+
+    @property
+    def quantity_step(self) -> int:
+        """COIN-M quantity step expressed as an integer contract count."""
+
+        return self.contract_step
+
+    @property
+    def min_qty(self) -> int:
+        return self.min_contracts
+
+    @property
+    def max_qty(self) -> Optional[int]:
+        return self.max_contracts
 
     def validate_order(self, price: Decimal, contracts: int) -> None:
         """Validate domain-level price and contract increments."""
@@ -152,6 +199,8 @@ class ExchangeOrderSnapshot:
     price: Optional[Decimal] = None
     average_fill_price: Optional[Decimal] = None
     reduce_only: bool = False
+    order_type: str = "LIMIT"
+    time_in_force: str = "GTC"
 
     def __post_init__(self) -> None:
         for field_name in ("symbol", "client_order_id", "exchange_order_id"):
@@ -167,6 +216,9 @@ class ExchangeOrderSnapshot:
         _require_enum(self.side, Side, "side")
         _require_enum(self.position_side, PositionSide, "position_side")
         _require_bool(self.reduce_only, "reduce_only")
+        for field_name in ("order_type", "time_in_force"):
+            value = require_non_empty(getattr(self, field_name), field_name).upper()
+            object.__setattr__(self, field_name, value)
         require_contracts(
             self.filled_contracts, "filled_contracts", non_negative=True
         )
@@ -194,6 +246,13 @@ class ExchangeOrderSnapshot:
         ):
             raise DomainValidationError(
                 "FILLED requires filled_contracts == original_contracts"
+            )
+        if (
+            self.status is ExchangeOrderStatus.REJECTED
+            and self.filled_contracts != 0
+        ):
+            raise DomainValidationError(
+                "REJECTED orders cannot carry filled contracts"
             )
         _normalize_optional_decimal(self.price, "price", positive=True)
         _normalize_optional_decimal(
@@ -344,6 +403,113 @@ class ExchangeMarginBalance:
         )
 
 
+class PositionMode(str, Enum):
+    """Account-level Binance position mode observed through the read port."""
+
+    ONE_WAY = "one_way"
+    HEDGE = "hedge"
+
+
+@dataclass(frozen=True)
+class PositionModeSnapshot:
+    """An immutable observation of account position mode."""
+
+    mode: PositionMode
+    observed_at: datetime
+
+    def __post_init__(self) -> None:
+        _require_enum(self.mode, PositionMode, "mode")
+        object.__setattr__(
+            self,
+            "observed_at",
+            require_utc(self.observed_at, "observed_at"),
+        )
+
+
+@dataclass(frozen=True)
+class MarginAccountSnapshot:
+    """Authoritative COIN-M margin account observation.
+
+    The per-asset balances remain available even when an exchange response does
+    not expose every account-wide total. Missing optional totals are distinct
+    from zero.
+    """
+
+    balances: tuple[ExchangeMarginBalance, ...]
+    observed_at: datetime
+    total_wallet_balance: Optional[Decimal] = None
+    total_unrealized_pnl: Optional[Decimal] = None
+    available_balance: Optional[Decimal] = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.balances, tuple):
+            raise DomainValidationError("balances must be tuple")
+        if any(not isinstance(item, ExchangeMarginBalance) for item in self.balances):
+            raise DomainValidationError(
+                "balances must contain ExchangeMarginBalance values"
+            )
+        assets = tuple(item.asset for item in self.balances)
+        if len(assets) != len(set(assets)):
+            raise DomainValidationError("balances must not contain duplicate assets")
+        object.__setattr__(
+            self,
+            "observed_at",
+            require_utc(self.observed_at, "observed_at"),
+        )
+        for field_name in (
+            "total_wallet_balance",
+            "total_unrealized_pnl",
+            "available_balance",
+        ):
+            _normalize_optional_decimal(getattr(self, field_name), field_name)
+
+
+@dataclass(frozen=True)
+class TradePage:
+    """One replay page together with evidence about pagination completeness."""
+
+    items: tuple[ExchangeFill, ...]
+    next_cursor: Optional[str]
+    complete: bool
+    snapshot_time: datetime
+    pagination_watermark: Optional[str]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.items, tuple):
+            raise DomainValidationError("items must be tuple")
+        if any(not isinstance(item, ExchangeFill) for item in self.items):
+            raise DomainValidationError("items must contain ExchangeFill values")
+        _require_bool(self.complete, "complete")
+        if self.next_cursor is not None:
+            object.__setattr__(
+                self,
+                "next_cursor",
+                require_non_empty(self.next_cursor, "next_cursor"),
+            )
+        if self.complete and self.next_cursor is not None:
+            raise DomainValidationError(
+                "a complete trade page must not expose next_cursor"
+            )
+        if not self.complete and self.next_cursor is None:
+            raise DomainValidationError(
+                "an incomplete trade page must expose next_cursor"
+            )
+        object.__setattr__(
+            self,
+            "snapshot_time",
+            require_utc(self.snapshot_time, "snapshot_time"),
+        )
+        if self.pagination_watermark is not None:
+            object.__setattr__(
+                self,
+                "pagination_watermark",
+                require_non_empty(
+                    self.pagination_watermark,
+                    "pagination_watermark",
+                ),
+            )
+
+
 @dataclass(frozen=True)
 class SubmitLimitOrder:
     """Exchange command DTO; ownership is carried by client_order_id."""
@@ -392,5 +558,9 @@ __all__ = [
     "ExchangeOrderSnapshot",
     "ExchangePosition",
     "InstrumentRules",
+    "MarginAccountSnapshot",
+    "PositionMode",
+    "PositionModeSnapshot",
     "SubmitLimitOrder",
+    "TradePage",
 ]

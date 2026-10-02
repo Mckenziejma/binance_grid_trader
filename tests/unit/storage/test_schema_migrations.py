@@ -22,7 +22,7 @@ class SchemaMigrationContractTests(unittest.TestCase):
                 versions = connection.execute(
                     "SELECT version FROM schema_migrations ORDER BY version"
                 ).fetchall()
-                self.assertEqual([1, 2], [row[0] for row in versions])
+                self.assertEqual([1, 2, 3], [row[0] for row in versions])
             finally:
                 connection.close()
 

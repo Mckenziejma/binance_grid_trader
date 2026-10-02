@@ -23,6 +23,10 @@ class NotReadyError(GridTraderError):
     """An action requiring READY was attempted in another readiness state."""
 
 
+class TradingDisabledError(GridTraderError):
+    """A write operation was attempted while the runtime is read-only."""
+
+
 class ExchangePortError(GridTraderError):
     """Base error raised by an exchange adapter at the port boundary."""
 
@@ -59,4 +63,5 @@ __all__ = [
     "InvalidStateTransition",
     "InvariantViolation",
     "NotReadyError",
+    "TradingDisabledError",
 ]

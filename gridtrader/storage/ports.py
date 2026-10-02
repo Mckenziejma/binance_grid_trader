@@ -63,6 +63,10 @@ class UnitOfWork(Protocol):
     events: Any
     bot_runs: Any
     strategy_leases: Any
+    instrument_rules: Any
+    position_mode_observations: Any
+    exchange_observations: Any
+    exchange_trade_observations: Any
 
     def __enter__(self) -> "UnitOfWork":
         ...
