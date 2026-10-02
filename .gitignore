@@ -57,6 +57,12 @@ coverage.xml
 *.log
 local_settings.py
 db.sqlite3
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
 nohub.out
 myquant.txt
 

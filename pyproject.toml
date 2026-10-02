@@ -1,0 +1,69 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "binance-coinm-dynamic-grid-bot"
+version = "0.1.0"
+description = "Safety-first foundation for a Binance COIN-M dynamic grid bot"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+
+[project.optional-dependencies]
+dev = [
+    "mypy>=1.14,<2",
+    "pytest>=8.3,<9",
+    "ruff>=0.9,<1",
+]
+
+[tool.setuptools.packages.find]
+include = [
+    "gridtrader",
+    "gridtrader.core*",
+    "gridtrader.exchange*",
+    "gridtrader.grid*",
+    "gridtrader.orders*",
+    "gridtrader.storage*",
+]
+
+[tool.setuptools.package-data]
+"gridtrader.storage.sqlite" = ["migrations/*.sql"]
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-config --strict-markers"
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_unreachable = true
+show_error_codes = true
+packages = [
+    "gridtrader.core",
+    "gridtrader.exchange",
+    "gridtrader.grid",
+    "gridtrader.orders",
+    "gridtrader.storage",
+]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+extend-exclude = [
+    "gridtrader/api",
+    "gridtrader/event",
+    "gridtrader/gateway",
+    "gridtrader/trader",
+    "main.py",
+    "main_futures_script.py",
+    "main_spot_script.py",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "SIM"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "auto"
